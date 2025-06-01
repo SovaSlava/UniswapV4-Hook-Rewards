@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.24;
+pragma solidity 0.8.26;
 
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
-import {Pool} from "v4-core/src/libraries/Pool.sol";
 import {BalanceDelta, BalanceDeltaLibrary, toBalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Position} from "v4-core/src/libraries/Position.sol";
@@ -12,169 +11,90 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
-import {FullMath} from "v4-core/src/libraries/FullMath.sol";
-//import {CurrencySettler} from "src/utils/CurrencySettler.sol";
-//import {Currency} from "v4-core/src/types/Currency.sol";
+import {Owned} from "solmate/src/auth/Owned.sol";
 
-/**
- * @dev This hook implements a mechanism penalize liquidity provision based on time of adding and removal of liquidty.
- * The main purpose is to prevent JIT (Just in Time) attacks on liquidity pools. Specifically,
- * it checks if a liquidity position was added to the pool within a certain block number range (at least 1 block)
- * and if so, it donates some of the fees to the pool (up to 100% of the fees). This way, the hook effectively taxes JIT attackers by donating their
- * expected profits back to the pool.
- * The hook calculates the fee donation based on the block number when the liquidity was added
- * and the block number offset.
- *
- * At constructor, the hook requires a block number offset. This offset is the number of blocks at which the hook
- * will donate the fees to the pool. The minimum value is 1.
- *
- * NOTE: The hook donates the fees to the current in range liquidity providers (at the time of liquidity removal).
- * If the block number offset is much later than the actual block number when the liquidity was added, the
- * liquidity providers who benefited from the fees will be the ones in range at the time of liquidity removal, not
- * the ones in range at the time of liquidity addition.
- *
- * WARNING: This is experimental software and is provided on an "as is" and "as available" basis. We do
- * not give any warranties and will not be liable for any losses incurred through any use of this code
- * base.
- *
- * _Available since v0.1.1_
- */
+contract LiquidityRewardHook is BaseHook, Owned {
 
-
- // todo
- // add onlyOwner2step
- // а если позиция изменяется - например уменьшается - какой хук и можно ли это отследить?
-contract LiquidityRewardHook is BaseHook {
-  //  using CurrencySettler for Currency;
     using StateLibrary for IPoolManager;
     using SafeCast for uint256;
 
-    /**
-     * @notice The minimum block number amount for the offset.
-     */
-    uint256 public constant MIN_BLOCK_NUMBER_OFFSET = 1;
+    /// @notice Minimum accumulated liquidity amount for reward. It is current value.
+    uint256 public minAccLiquidityForReward;
 
-    /**
-     * @notice Tracks the last block number when a liquidity position was added to the pool.
-     */
-    mapping(PoolId id => mapping(bytes32 positionKey => uint256 blockNumber)) public lastAddedLiquidity;
+    /// @notice Reward rate per liquidity 
+    uint256 public rewardRatePerAccLiquidity;
 
-    /**
-     * @notice The block number offset before which if the liquidity is removed, the fees will be donated to the pool.
-     */
-    uint256 public immutable blockNumberOffset;
+    uint256 constant public BASIS_POINTS = 10000;
 
-    /**
-     * @dev Hook was attempted to be deployed with a block number offset that is too low.
-     */
-    error BlockNumberOffsetTooLow();
-
-    /**
-     * @dev Set the `PoolManager` address and the block number offset.
-     */
-    constructor(IPoolManager _poolManager, uint256 _blockNumberOffset) BaseHook(_poolManager) {
-        if (_blockNumberOffset < MIN_BLOCK_NUMBER_OFFSET) revert BlockNumberOffsetTooLow();
-        blockNumberOffset = _blockNumberOffset;
+    struct LiquidityPosition {
+        uint256 liquidity;              
+        uint256 lastUpdateTimestamp;   
+        uint256 accumulatedLiquidityTime; 
+        uint256 minTimeElapsed;
+        uint256 minLqAmount;
+        uint256 rewardRatePerAccLiquidity;
     }
 
-    /**
-     * @dev Hooks into the `afterAddLiquidity` hook to record the block number when the liquidity was added to track
-     * JIT liquidity positions.
-     */
-    function _afterAddLiquidity(
-        address sender,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) internal virtual override returns (bytes4, BalanceDelta) {
-        // Get the position key
-        bytes32 positionKey = Position.calculatePositionKey(sender, params.tickLower, params.tickUpper, params.salt);
+    /// @notice Track reward multiplier of users 
+    mapping(address => uint256) public multiplier;
 
-        // Record the block number when the liquidity was added
-        lastAddedLiquidity[key.toId()][positionKey] = block.number;
+    /// @notice Positio key => Liquidity position data
+    mapping(bytes32 => LiquidityPosition) public positions;
 
-        return (this.afterAddLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
+    /// @notice Is pool allowed 
+    mapping(PoolId => bool) public allowedPools;
+    
+    /// @notice ERC20 reward token
+    address public immutable rewardToken;
+
+    event RewardMultiplierChanged(address indexed lp, uint256 oldMultiplier, uint256 newMultiplier);
+    event MinLqAmountChanged(uint256 oldValue, uint256 newValue);
+    event AllowedPoolChanged(PoolId indexed poolId, bool oldValue, bool newValue);
+    event MinAccLiqiudityForRewardChanged(uint256 oldValue, uint256 newValue);
+    event RewardRateChanged(uint256 oldValue, uint256 newValue);
+    event CantMintReward(address indexed user, bytes reason);
+    event Reward(address indexed user, uint256 amount);
+
+    /**  
+     * @param poolManager_ Address of pool manager
+     * @param hookOwner Hook's owner address 
+     * @param token ERC20 token for reward LPs
+     * @param minAccLiquidity_ Minimul accumulated liquidity for reward
+     * @param rewardRatePerAccLiquidity_ Reward rate for accumulated liquidity
+    */
+    constructor(
+        IPoolManager poolManager_, 
+        address hookOwner,
+        address token,
+        uint256 minAccLiquidity_,
+        uint256 rewardRatePerAccLiquidity_) BaseHook(poolManager_) Owned(hookOwner) {
+        rewardToken = token;
+        minAccLiquidityForReward = minAccLiquidity_;
+        rewardRatePerAccLiquidity = rewardRatePerAccLiquidity_;
     }
 
-    /**
-     * @dev Hooks into the `afterRemoveLiquidity` hook to donate accumulated fees for a JIT liquidity position created.
-     */
-    function _afterRemoveLiquidity(
-        address sender,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
-        BalanceDelta,
-        BalanceDelta feeDelta,
-        bytes calldata
-    ) internal virtual override returns (bytes4, BalanceDelta) {
-        PoolId id = key.toId();
-
-        bytes32 positionKey = Position.calculatePositionKey(sender, params.tickLower, params.tickUpper, params.salt);
-
-        uint128 liquidity = poolManager.getLiquidity(id);
-        
-        // We need to check if the liquidity is greater than 0 to prevent donating when there are no liquidity positions.
-        if (block.number - lastAddedLiquidity[id][positionKey] < blockNumberOffset && liquidity > 0) {
-            // If the liquidity provider removes liquidity before the block number offset, the hook donates
-            // a part of the fees to the pool (i.e., in range liquidity providers at the time of liquidity removal).
-
-            BalanceDelta liquidityPenalty = _calculateLiquidityPenalty(feeDelta, id, positionKey);
-
-            BalanceDelta deltaHook = poolManager.donate(
-                key, uint256(int256(liquidityPenalty.amount0())), uint256(int256(liquidityPenalty.amount1())), ""
-            );
-
-            BalanceDelta returnDelta = toBalanceDelta(-deltaHook.amount0(), -deltaHook.amount1());
-
-            return (this.afterRemoveLiquidity.selector, returnDelta);
-        }
-        
-        return (this.afterRemoveLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
+     function setRewardMultiplier(address lp, uint256 m) external onlyOwner {
+        emit RewardMultiplierChanged(lp, multiplier[lp], m);
+        multiplier[lp] = m;
     }
 
-    /**
-     * @dev Calculates the fee donation when a liquidity position is removed before the block number offset.
-     *
-     * @param feeDelta The `BalanceDelta` of the fees from the position.
-     * @param poolId The `PoolId` of the pool.
-     * @param positionKey The `bytes32` key of the position.
-     * @return liquidityPenalty The `BalanceDelta` of the liquidity penalty.
-     */
-    function _calculateLiquidityPenalty(BalanceDelta feeDelta, PoolId poolId, bytes32 positionKey)
-        internal
-        virtual
-        returns (BalanceDelta liquidityPenalty)
-    {
-        int128 amount0FeeDelta = feeDelta.amount0();
-        int128 amount1FeeDelta = feeDelta.amount1();
-
-        // amount0 and amount1 are necesseraly greater than or equal to 0, since they are fee rewards
-        // This is the implementation of a linear penalty on the fees, where the penalty decreases linearly from 100% of the fees at the block
-        // where liquidity was added to the pool to 0% after the block number offset.
-        // The formula is:
-        // liquidityPenalty = feeDelta * ( 1 - (block.number - lastAddedLiquidity[id][positionKey]) / blockNumberOffset)
-        // NOTE: this function is called only if the liquidity is removed before the block number offset, i.e.,
-        // block.number - lastAddedLiquidity[poolId][positionKey] < blockNumberOffset
-        // so the subtraction is safe and won't overflow
-        uint256 amount0LiquidityPenalty = FullMath.mulDiv(
-            SafeCast.toUint128(amount0FeeDelta),
-            blockNumberOffset - (block.number - lastAddedLiquidity[poolId][positionKey]), // wont't overflow, since block.number - lastAddedLiquidity[poolId][positionKey] < blockNumberOffset
-            blockNumberOffset
-        );
-        uint256 amount1LiquidityPenalty = FullMath.mulDiv(
-            SafeCast.toUint128(amount1FeeDelta),
-            blockNumberOffset - (block.number - lastAddedLiquidity[poolId][positionKey]),
-            blockNumberOffset
-        );
-
-        // although the amounts are returned as uint256, they must fit in int128, since they are fee rewards
-        liquidityPenalty = toBalanceDelta(amount0LiquidityPenalty.toInt128(), amount1LiquidityPenalty.toInt128());
+    function setAllowedPool(PoolId poolId, bool value) external onlyOwner {
+        emit AllowedPoolChanged(poolId, allowedPools[poolId], value);
+        allowedPools[poolId] = value;
     }
 
-    /**
-     * Set the hooks permissions, specifically `afterAddLiquidity`, `afterRemoveLiquidity` and `afterRemoveLiquidityReturnDelta`.
+    function setMinAccLiquidityForReward(uint256 minAccLiquidityForReward_) external onlyOwner {
+        emit MinAccLiqiudityForRewardChanged(minAccLiquidityForReward, minAccLiquidityForReward_);
+        minAccLiquidityForReward = minAccLiquidityForReward_;
+    }
+
+    function setRewardRatePerAccLiquidity(uint256 rewardRatePerAccLiquidity_) external onlyOwner {
+        emit RewardRateChanged(rewardRatePerAccLiquidity, rewardRatePerAccLiquidity_);
+        rewardRatePerAccLiquidity = rewardRatePerAccLiquidity_;     
+    }
+
+     /**
+     * Set the hooks permissions, specifically `afterAddLiquidity` and  `afterRemoveLiquidity`
      *
      * @return permissions The permissions for the hook.
      */
@@ -195,5 +115,84 @@ contract LiquidityRewardHook is BaseHook {
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
+    }
+
+    /**
+     * @dev Hooks into the `afterAddLiquidity` hook to update accumulated liqiudity data and store block timestamp
+     */
+    function _afterAddLiquidity(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) internal virtual override returns (bytes4, BalanceDelta) {
+        PoolId id = key.toId();
+        bytes32 positionKey = Position.calculatePositionKey(sender, params.tickLower, params.tickUpper, params.salt);
+        uint128 liquidity = poolManager.getLiquidity(id);
+
+        if(allowedPools[id]) {
+            LiquidityPosition storage pos = positions[positionKey];
+
+            bool newPosition = pos.lastUpdateTimestamp == 0 ? true : false;
+            update(pos, liquidity, newPosition);    
+        }
+
+        return (this.afterAddLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
+    }
+
+    /**
+     * @dev Hooks into the `afterRemoveLiquidity` hook to calculate reward
+     */
+    function _afterRemoveLiquidity(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata hookData
+    ) internal virtual override returns (bytes4, BalanceDelta) {
+        PoolId id = key.toId();
+        bytes32 positionKey = Position.calculatePositionKey(sender, params.tickLower, params.tickUpper, params.salt);
+        LiquidityPosition storage pos = positions[positionKey];
+        
+        if(allowedPools[id] || pos.lastUpdateTimestamp != 0 ) {
+            
+            uint128 liquidity = poolManager.getLiquidity(id);
+            update(pos, liquidity, false);
+
+            uint256 rewardAmount = pos.accumulatedLiquidityTime * pos.rewardRatePerAccLiquidity;
+            address user = abi.decode(hookData, (address));
+         
+            if(rewardAmount >= minAccLiquidityForReward) {
+                
+                if(multiplier[user] > 0) {
+                    rewardAmount += rewardAmount * multiplier[user] / BASIS_POINTS;
+                }
+                pos.accumulatedLiquidityTime = 0;
+                (bool success, bytes memory reason) = rewardToken.call(abi.encodeWithSelector(0x40c10f19, user, rewardAmount));
+
+                if(success) emit Reward(user, rewardAmount);
+                else emit CantMintReward(user, reason);
+            }
+
+        }
+        
+        return (this.afterRemoveLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
+    }
+
+    function update(LiquidityPosition storage pos, uint128 liquidity, bool isNew) internal {
+        if(isNew) {
+            pos.rewardRatePerAccLiquidity = rewardRatePerAccLiquidity;
+        }
+        else {
+            uint256 timeElapsed = block.timestamp - pos.lastUpdateTimestamp;
+            if(timeElapsed != 0) {
+                pos.accumulatedLiquidityTime += pos.liquidity * timeElapsed;
+            }
+        }
+        pos.liquidity = liquidity / 1 ether;
+        pos.lastUpdateTimestamp = block.timestamp;
     }
 }
