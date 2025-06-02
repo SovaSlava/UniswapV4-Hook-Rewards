@@ -1,23 +1,23 @@
-# v4-template
-### **A template for writing Uniswap v4 Hooks 🦄**
+# Uniswap v4 Hook -  Rewardin liquidity providers for ERC20-tokens 🦄
+### **The hook supports flexible reward settings**
 
-[`Use this Template`](https://github.com/uniswapfoundation/v4-template/generate)
+Created based on a template [`v4-template`](https://github.com/uniswapfoundation/v4-template/generate)
 
-1. The example hook [Counter.sol](src/Counter.sol) demonstrates the `beforeSwap()` and `afterSwap()` hooks
-2. The test template [Counter.t.sol](test/Counter.t.sol) preconfigures the v4 pool manager, test tokens, and test liquidity.
+### Description
 
-<details>
-<summary>Updating to v4-template:latest</summary>
+The hook is designed to reward liquidity providers with ERC20 tokens. The reward is calculated when they withdraw liquidity in full or in part.
 
-This template is actively maintained -- you can update the v4 dependencies, scripts, and helpers: 
-```bash
-git remote add template https://github.com/uniswapfoundation/v4-template
-git fetch template
-git merge template/main <BRANCH> --allow-unrelated-histories
-```
+When the LP provides liquidity, the hook records the amount and the current time. Later, when liquidity is withdrawn, the reward is calculated based on this data and the hook accesses the token contract, calling the mint and mintit functions of the token to the user's address, or to another address that the user can specify.
 
-</details>
+### Key Features
 
+* Setting an individual multiplier for each user
+* Support for increasing liquidity and partial withdrawal of liquidity
+* Ability to set a minimum threshold of accumulated liquidity, reaching which the user will be rewarded
+* Ability to set the rate for calculating the reward. Moreover, the rate is saved in the user structure, so the user can be sure that the rate for him will not change
+* The hook will notify about the problem when minting the reward token (if this happens) through the event - CantMintReward
+
+Hook has tests in test folder.
 ---
 
 ### Check Forge Installation
