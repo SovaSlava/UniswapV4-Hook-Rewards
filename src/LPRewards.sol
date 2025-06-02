@@ -30,7 +30,6 @@ contract LiquidityRewardHook is BaseHook, Owned {
         uint256 liquidity;              
         uint256 lastUpdateTimestamp;   
         uint256 accumulatedLiquidityTime; 
-        uint256 minTimeElapsed;
         uint256 minLqAmount;
         uint256 rewardRatePerAccLiquidity;
     }
